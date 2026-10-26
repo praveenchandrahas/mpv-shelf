@@ -1,5 +1,9 @@
 # mpv-shelf
 
+![mpv-shelf: your film library on your TV. A lean media shelf for mpv](docs/img/banner.png)
+
+*Illustration, not a screenshot. The screen, the sidebar and every poster in it are made up for the picture, and some of what it shows is not in version 1: playlists, themes, a Settings page, the sidebar and the large hero banner do not exist (only an accent colour, the number of columns and a few behaviours are configurable; see "Options"). What works today is described in the text below.*
+
 A Netflix-style film browser for [mpv](https://mpv.io), over a **local folder** such as a debrid/WebDAV mount. Posters, ratings and quality chips, a Continue Watching row, search, TV seasons, and it remembers where you stopped.
 
 ![Illustration of the home screen](docs/img/preview-home.png)
