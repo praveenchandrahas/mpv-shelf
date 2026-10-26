@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""shelf-index: builds the catalog that the mpv-shelf browser (shelf.lua) shows.
+
+  shelf-index [scan]     list the library, group releases, write catalog.json, then fetch posters/ratings from TMDB (if a key is set)
+  shelf-index plan       dry run: print what would be in the catalog (no writes, no network)
+  shelf-index status     what the last run produced
+
+The library is only ever LISTED (directory listings and stat); no file in it is opened, and nothing is written to it.
+Settings: ~/.config/seekthumbs/config.ini, section [shelf] (falls back to [seekthumbs] for library and min_size_mb), or the options below.
+  [shelf]  library, min_size_mb, tmdb_key, data_dir, network (yes/no)
+Everything it keeps is in the data folder (default ~/.local/share/mpv-shelf): catalog.json, meta.json (TMDB answers, kept for good), posters/.
+Without a TMDB key, or offline, the catalog is still built: cards then show titles and quality chips only.
+"""
+import argparse
+import configparser
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = 1
+VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".m2ts", ".webm", ".wmv"}
+CONFIG = "~/.config/seekthumbs/config.ini"
+DATA_DIR = "~/.local/share/mpv-shelf"
+MISS_RETRY_S = 7 * 86400
+TMDB_API = "https://api.themoviedb.org/3"
+TMDB_IMG = "https://image.tmdb.org/t/p/w342"
+POSTER_W = 300
+REQUEST_GAP_S = 0.25      # at most about 4 requests a second: polite to TMDB
+
+# ---------------------------------------------------------------- release names
+SITE_TAG = re.compile(r"^\s*(?:www\.)?[\w-]+\.(?:org|com|net|to|me|cc|ru|io|tv|info|pw)\s*[-–—]+\s*", re.I)
+LEAD_BRACKET = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
+YEAR = re.compile(r"(?<![\w])\(?((?:19|20)\d{2})(?!\d)", re.I)
+TV = re.compile(r"(?<![a-z0-9])s(\d{1,2})[ ._-]?e(\d{1,3})(?:[ ._-]?e?(\d{1,3}))?(?![a-z0-9])|(?<![a-z0-9])(\d{1,2})x(\d{2,3})(?![a-z0-9])", re.I)
+QUALITY_START = re.compile(
+    r"(?<![a-z0-9])(2160p|4k|uhd|1080[pi]|720p|576p|480[pi]|blu[- ]?ray|bdrip|brrip|web[- ]?dl|web[- ]?rip|webrip|remux|hdtv|dvdrip|dvd|"
+    r"hdr10\+?|hdr|dovi|x26[45]|h[ .]?26[45]|hevc|multi|repack|proper)(?![a-z0-9])", re.I)
+IMDB = re.compile(r"tt\d{7,10}")
+BAD_GROUPS = {"dl", "hd", "ray", "rip", "ma", "x", "264", "265", "5", "1", "0", "3", "7", "10", "hdr", "dv"}
+
+
+def strip_tags(s):
+    s = SITE_TAG.sub("", s)
+    return LEAD_BRACKET.sub("", s)
+
+
+def normalise_key(title):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", title.lower())).strip()
+
+
+def tidy_title(t):
+    t = re.sub(r"\[[^\]]*\]|\{[^}]*\}", " ", t)
+    t = re.sub(r"[(\[{]+\s*$", "", t)
+    t = re.sub(r"\s*[-–—]+\s*", " ", t)       # "Hopeu - Hope" and "Movie-Name" both become words
+    t = re.sub(r"\s+", " ", t).strip(" .-_")
+    if t and (t == t.upper() or t == t.lower()) and len(t) > 3:
+        t = t.title()                                    # PROJECT HAIL MARY, a lower-case release name
+    return t
+
+
+def chips_of(text):
+    """Quality labels found in a release name, in display order."""
+    s = text.lower()
+    out = []
+    res = None
+    if re.search(r"(?<![a-z0-9])(2160p|4k|uhd)(?![a-z0-9])", s):
+        res = "4K"
+    elif re.search(r"(?<![a-z0-9])1080[pi](?![a-z0-9])", s):
+        res = "1080p"
+    elif re.search(r"(?<![a-z0-9])720p(?![a-z0-9])", s):
+        res = "720p"
+    elif re.search(r"(?<![a-z0-9])(576p|480[pi])(?![a-z0-9])", s):
+        res = "480p"
+    if res:
+        out.append(res)
+    if re.search(r"(?<![a-z0-9])remux(?![a-z0-9])", s):
+        out.append("REMUX")
+    elif re.search(r"web[- ]?dl", s):
+        out.append("WEB-DL")
+    elif re.search(r"(?<![a-z0-9])web[- ]?rip(?![a-z0-9])", s):
+        out.append("WEBRip")
+    elif re.search(r"blu[- ]?ray|bdrip|brrip", s):
+        out.append("Blu-ray")
+    elif re.search(r"(?<![a-z0-9])(dvd|dvdrip)(?![a-z0-9])", s):
+        out.append("DVD")
+    elif re.search(r"(?<![a-z0-9])hdtv(?![a-z0-9])", s):
+        out.append("HDTV")
+    if re.search(r"hdr10\+", s):
+        out.append("HDR10+")
+    elif re.search(r"(?<![a-z0-9])hdr10(?![a-z0-9])", s):
+        out.append("HDR10")
+    elif re.search(r"(?<![a-z0-9])hdr(?![a-z0-9])", s):
+        out.append("HDR")
+    if re.search(r"(?<![a-z0-9])(dv|dovi)(?![a-z0-9])|dolby[ .]?vision", s):
+        out.append("DV")
+    if "atmos" in s:
+        out.append("Atmos")
+    if "truehd" in s:
+        out.append("TrueHD")
+    if re.search(r"dts[- .]?hd[ .-]?ma", s):
+        out.append("DTS-HD MA")
+    elif re.search(r"dts[- .]?hd", s):
+        out.append("DTS-HD")
+    elif re.search(r"dts[: .-]?x(?![a-z0-9])", s):
+        out.append("DTS:X")
+    elif re.search(r"(?<![a-z0-9])dts(?![a-z0-9])", s):
+        out.append("DTS")
+    if re.search(r"(?<![a-z0-9])(ddp|dd\+|eac3|e-ac-3)", s):
+        out.append("DD+")
+    elif re.search(r"(?<![a-z0-9])(dd[ .]?[25]|dd5|ac3)", s):
+        out.append("DD")
+    if re.search(r"(?<![a-z0-9])aac", s):
+        out.append("AAC")
+    if re.search(r"hevc|x265|h[ .]?265", s):
+        out.append("HEVC")
+    elif re.search(r"x264|h[ .]?264|(?<![a-z0-9])avc(?![a-z0-9])", s):
+        out.append("AVC")
+    return out
+
+
+def res_rank(chips):
+    return {"4K": 4, "1080p": 3, "720p": 2, "480p": 1}.get(next((c for c in chips if c in ("4K", "1080p", "720p", "480p")), ""), 0)
+
+
+def release_group(stem):
+    m = re.search(r"-([A-Za-z0-9][A-Za-z0-9_.]{1,20})$", stem.strip())
+    if not m:
+        return None
+    g = m.group(1)
+    return None if g.lower() in BAD_GROUPS or len(g) < 3 else g
+
+
+def parse_name(stem, folder=""):
+    """What a release name tells: kind, title, year, key, season/episode, quality chips, group, imdb id.
+    The file's own name is used; the folder name only for what the file name lacks (an IMDb id, usually)."""
+    raw = stem
+    found = IMDB.search(raw) or IMDB.search(folder or "")
+    imdb = found.group(0) if found else None
+    s = re.sub(r"[._]+", " ", strip_tags(stem))
+    chips = chips_of(s)
+    out = {"kind": "film", "title": "", "year": None, "key": "", "season": None, "episode": None, "chips": chips,
+           "group": release_group(raw), "imdb": imdb}
+    m = TV.search(s)
+    if m and m.start() > 0:
+        before = s[:m.start()]
+        ym = list(YEAR.finditer(before))
+        year = None
+        if ym and ym[-1].start() > 0:
+            year = int(ym[-1].group(1)); before = before[:ym[-1].start()]
+        out.update(kind="episode", season=int(m.group(1) or m.group(4)), episode=int(m.group(2) or m.group(5)), year=year)
+        out["title"] = tidy_title(before)
+        out["key"] = normalise_key(out["title"])
+        return out
+    q = QUALITY_START.search(s)
+    qpos = q.start() if q else len(s)
+    cands = [y for y in YEAR.finditer(s) if y.start() > 0 and (y.start() < qpos or not q)]
+    if cands:
+        y = cands[-1]
+        out["year"] = int(y.group(1))
+        title = s[:y.start()]
+    else:
+        title = s[:qpos] if qpos > 0 else s
+    out["title"] = tidy_title(title) or tidy_title(s)
+    out["key"] = normalise_key(out["title"])
+    return out
+
+
+# ---------------------------------------------------------------- the library
+def list_library(root, min_size):
+    """[(relative path, size, mtime)] of video files at least min_size bytes. Directory listings and stat only."""
+    out = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file() and os.path.splitext(e.name)[1].lower() in VIDEO_EXT:
+                            st = e.stat()
+                            if st.st_size >= min_size:
+                                out.append((os.path.relpath(e.path, root), st.st_size, st.st_mtime))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return sorted(out)
+
+
+def entry_id(kind, key, year, rel=""):
+    return hashlib.sha1(f"{kind}|{key}|{year or ''}|{rel if not year and kind == 'film' else ''}".encode()).hexdigest()[:12]
+
+
+def release_obj(rel, size, mtime, info):
+    chips = info["chips"]
+    return {"rel": rel, "size": size, "mtime": int(mtime), "res": res_rank(chips), "chips": chips, "group": info["group"],
+            "label": " · ".join(chips) if chips else "Unknown quality"}
+
+
+def best_first(rels):
+    return sorted(rels, key=lambda r: (-r["res"], -("REMUX" in r["chips"]), -r["size"], r["rel"]))
+
+
+def build_catalog(files):
+    """Group parsed files into catalog entries. Films with the same title and year are ONE entry with all their releases; a film name without a year
+    is never grouped (it stays single); episodes are grouped by show, then season."""
+    films, shows = {}, {}
+    for rel, size, mtime in files:
+        stem = os.path.splitext(os.path.basename(rel))[0]
+        info = parse_name(stem, os.path.dirname(rel))
+        if not info["key"]:
+            continue
+        r = release_obj(rel, size, mtime, info)
+        if info["kind"] == "episode":
+            k = (info["key"], info["year"])
+            e = shows.setdefault(k, {"id": entry_id("show", info["key"], info["year"]), "kind": "show", "title": info["title"], "year": info["year"],
+                                     "key": info["key"], "imdb": info["imdb"], "seasons": {}, "added": 0})
+            r.update(episode=info["episode"])
+            e["seasons"].setdefault(str(info["season"]), []).append(r)
+            e["added"] = max(e["added"], r["mtime"])
+        else:
+            k = (info["key"], info["year"]) if info["year"] else (info["key"], None, rel)
+            e = films.setdefault(k, {"id": entry_id("film", info["key"], info["year"], rel), "kind": "film", "title": info["title"], "year": info["year"],
+                                     "key": info["key"], "imdb": info["imdb"], "releases": [], "added": 0})
+            e["releases"].append(r)
+            e["imdb"] = e["imdb"] or info["imdb"]
+            e["added"] = max(e["added"], r["mtime"])
+    for e in films.values():
+        e["releases"] = best_first(e["releases"])
+    for e in shows.values():
+        for sn in e["seasons"]:
+            e["seasons"][sn].sort(key=lambda r: (r["episode"], -r["res"], -r["size"]))
+    entries = sorted(list(films.values()) + list(shows.values()), key=lambda e: (-e["added"], e["key"]))
+    return entries
+
+
+# ---------------------------------------------------------------- TMDB (metadata is optional)
+class Offline(Exception):
+    pass
+
+
+def http_get(url, headers=None, timeout=15):
+    """The only network function; the tests replace it."""
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "mpv-shelf"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read(), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read() if hasattr(e, "read") else b"", dict(e.headers or {})
+    except (urllib.error.URLError, OSError) as e:
+        raise Offline(str(e))
+
+
+class Tmdb:
+    def __init__(self, key, sleep=time.sleep):
+        self.key, self.sleep, self.last = key.strip(), sleep, 0.0
+        self.token = self.key.startswith("eyJ")
+
+    def get_json(self, path, **params):
+        headers = {"User-Agent": "mpv-shelf", "Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.key
+        else:
+            params["api_key"] = self.key
+        url = f"{TMDB_API}{path}?{urllib.parse.urlencode(params)}"
+        for attempt in range(4):
+            wait = REQUEST_GAP_S - (time.monotonic() - self.last)
+            if wait > 0:
+                self.sleep(wait)
+            self.last = time.monotonic()
+            code, body, hdr = http_get(url, headers)
+            if code == 429:
+                self.sleep(min(30, float(hdr.get("Retry-After", "2") or 2)))
+                continue
+            if code == 200:
+                return json.loads(body.decode("utf-8", "replace"))
+            if code in (401, 403):
+                raise PermissionError(f"TMDB refused the key (HTTP {code})")
+            return None
+        return None
+
+    def lookup(self, entry):
+        """Metadata for a catalog entry, or None when TMDB has nothing."""
+        kind = "movie" if entry["kind"] == "film" else "tv"
+        hit = None
+        if entry.get("imdb"):
+            j = self.get_json(f"/find/{entry['imdb']}", external_source="imdb_id")
+            rs = (j or {}).get("movie_results" if kind == "movie" else "tv_results") or []
+            hit = rs[0] if rs else None
+        if hit is None:
+            p = {"query": entry["title"]}
+            if entry.get("year"):
+                p["year" if kind == "movie" else "first_air_date_year"] = entry["year"]
+            j = self.get_json(f"/search/{kind}", **p)
+            rs = (j or {}).get("results") or []
+            hit = rs[0] if rs else None
+        if hit is None:
+            return None
+        d = self.get_json(f"/{kind}/{hit['id']}") or {}
+        runtime = d.get("runtime") if kind == "movie" else (d.get("episode_run_time") or [None])[0]
+        date = hit.get("release_date") or hit.get("first_air_date") or ""
+        return {"tmdb_id": hit["id"], "title": hit.get("title") or hit.get("name") or entry["title"],
+                "year": int(date[:4]) if date[:4].isdigit() else entry.get("year"),
+                "rating": round(float(hit.get("vote_average") or 0), 1) or None, "runtime": runtime,
+                "genres": [g["name"] for g in d.get("genres", [])], "overview": hit.get("overview") or "",
+                "poster_path": hit.get("poster_path")}
+
+
+def meta_key(e):
+    return f"{e['kind']}|{e['key']}|{e.get('year') or ''}"
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+def fetch_poster(poster_path, dest, ffmpeg=True):
+    """Downloads a poster once; scales it to about 300 px wide when ffmpeg exists. Returns True on success."""
+    code, body, _ = http_get(TMDB_IMG + poster_path)
+    if code != 200 or not body:
+        return False
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    raw = dest + ".dl"
+    with open(raw, "wb") as f:
+        f.write(body)
+    if ffmpeg and shutil.which("ffmpeg"):
+        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", raw, "-vf", f"scale={POSTER_W}:-2", "-q:v", "4", dest], capture_output=True)
+        if r.returncode == 0 and os.path.exists(dest):
+            os.remove(raw)
+            return True
+    os.replace(raw, dest)
+    return True
+
+
+def apply_meta(entries, meta, posters_dir):
+    for e in entries:
+        m = meta.get(meta_key(e))
+        if not m or m.get("miss"):
+            continue
+        poster = m.get("poster")
+        if poster and not os.path.exists(os.path.join(posters_dir, poster)):
+            poster = None
+        e["meta"] = {"tmdb_id": m.get("tmdb_id"), "title": m.get("title"), "rating": m.get("rating"), "runtime": m.get("runtime"),
+                     "genres": m.get("genres") or [], "overview": m.get("overview") or "", "poster": poster, "year": m.get("year")}
+        if m.get("title"):
+            e["title"] = m["title"]
+        if not e.get("year") and m.get("year"):
+            e["year"] = m["year"]
+
+
+def fill_metadata(entries, meta, data_dir, tmdb, save, say=print, now=time.time):
+    """Fetches what is missing, one entry at a time. Calls save() every few entries so the browser sees results early. Returns (done, failed)."""
+    pdir = os.path.join(data_dir, "posters")
+    todo = []
+    for e in entries:
+        m = meta.get(meta_key(e))
+        if m is None or (m.get("miss") and now() - m.get("fetched", 0) > MISS_RETRY_S):
+            todo.append(e)
+        elif m and not m.get("miss") and m.get("poster_path") and not m.get("poster") and not os.path.exists(os.path.join(pdir, f"{e['id']}.jpg")):
+            todo.append(e)
+    n = 0
+    for e in todo:
+        k = meta_key(e)
+        try:
+            found = tmdb.lookup(e)
+        except Offline as ex:
+            say(f"offline ({ex}); artwork will be fetched next time")
+            return n, len(todo) - n
+        except PermissionError as ex:
+            say(str(ex))
+            return n, len(todo) - n
+        if not found:
+            meta[k] = {"miss": True, "fetched": int(now())}
+        else:
+            pp = found.pop("poster_path", None)
+            found["poster_path"] = pp
+            found["fetched"] = int(now())
+            found["poster"] = None
+            if pp:
+                try:
+                    if fetch_poster(pp, os.path.join(pdir, f"{e['id']}.jpg")):
+                        found["poster"] = f"{e['id']}.jpg"
+                except Offline:
+                    pass
+            meta[k] = found
+        n += 1
+        if n % 20 == 0:
+            save()
+    save()
+    return n, 0
+
+
+# ---------------------------------------------------------------- settings and commands
+def read_settings(args):
+    cp = configparser.ConfigParser()
+    cp.read(os.path.expanduser(args.config or CONFIG))
+    def get(section, key, default=None):
+        return cp.get(section, key, fallback=default).strip() if cp.has_option(section, key) else default
+    s = {}
+    s["library"] = os.path.expanduser(args.library or get("shelf", "library") or get("seekthumbs", "library") or "")
+    s["min_size_mb"] = float(args.min_size_mb if args.min_size_mb is not None else (get("shelf", "min_size_mb") or get("seekthumbs", "min_size_mb") or 0))
+    s["tmdb_key"] = args.tmdb_key if args.tmdb_key is not None else (get("shelf", "tmdb_key") or "")
+    s["data_dir"] = os.path.expanduser(args.data_dir or get("shelf", "data_dir") or DATA_DIR)
+    net = (get("shelf", "network") or "yes").lower()
+    s["network"] = not args.no_network and net not in ("no", "false", "0", "off")
+    return s
+
+
+def log(*a):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
+
+
+def library_ready(lib):
+    try:
+        return bool(lib) and len(os.listdir(lib)) > 0
+    except OSError:
+        return False
+
+
+def cmd_plan(s, out=sys.stdout):
+    if not library_ready(s["library"]):
+        print("library folder is missing or empty (mount down?): nothing to plan", file=sys.stderr)
+        return 1
+    files = list_library(s["library"], s["min_size_mb"] * 1e6)
+    entries = build_catalog(files)
+    films = [e for e in entries if e["kind"] == "film"]
+    shows = [e for e in entries if e["kind"] == "show"]
+    for e in entries:
+        if e["kind"] == "film":
+            n = len(e["releases"])
+            print(f"film  {e['title']}" + (f" ({e['year']})" if e["year"] else "  [no year: never grouped]") + (f"  - {n} releases share this entry" if n > 1 else ""), file=out)
+        else:
+            eps = sum(len(v) for v in e["seasons"].values())
+            print(f"show  {e['title']}  - {len(e['seasons'])} season(s), {eps} file(s)", file=out)
+    print(f"{len(files)} file(s) -> {len(films)} film entr(ies), {len(shows)} show(s); {sum(1 for e in films if len(e['releases']) > 1)} film(s) with several releases", file=out)
+    return 0
+
+
+def cmd_status(s):
+    cat = load_json(os.path.join(s["data_dir"], "catalog.json"), None)
+    if not cat:
+        print(f"no catalog yet in {s['data_dir']} (run: shelf-index scan)")
+        return 0
+    es = cat.get("entries", [])
+    with_meta = sum(1 for e in es if e.get("meta"))
+    with_poster = sum(1 for e in es if (e.get("meta") or {}).get("poster"))
+    print(f"catalog of {cat.get('generated')} (state {cat.get('state')}): {len(es)} entries "
+          f"({sum(1 for e in es if e['kind'] == 'film')} films, {sum(1 for e in es if e['kind'] == 'show')} shows); "
+          f"{with_meta} with TMDB data, {with_poster} with posters; library {cat.get('library')}")
+    return 0
+
+
+class Lock:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        try:
+            with open(self.path) as f:
+                pid = int(f.read().strip() or 0)
+            if pid and pid != os.getpid():
+                os.kill(pid, 0)
+                raise RuntimeError(f"another shelf-index is running (pid {pid})")
+        except (OSError, ValueError):
+            pass
+        with open(self.path, "w") as f:
+            f.write(str(os.getpid()))
+        return self
+
+    def __exit__(self, *a):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+
+def cmd_scan(s, tmdb=None):
+    if not library_ready(s["library"]):
+        log("library folder is missing or empty (mount down?); catalog left as it was")
+        return 1
+    dd = s["data_dir"]
+    try:
+        lock = Lock(os.path.join(dd, "index.lock"))
+        lock.__enter__()
+    except RuntimeError as e:
+        log(str(e)); return 0
+    try:
+        files = list_library(s["library"], s["min_size_mb"] * 1e6)
+        entries = build_catalog(files)
+        meta = (load_json(os.path.join(dd, "meta.json"), {}) or {}).get("items") or {}
+        pdir = os.path.join(dd, "posters")
+        cat_path, meta_path = os.path.join(dd, "catalog.json"), os.path.join(dd, "meta.json")
+
+        def save(state="metadata"):
+            apply_meta(entries, meta, pdir)
+            pending = sum(1 for e in entries if meta_key(e) not in meta)
+            write_json(cat_path, {"version": VERSION, "generated": datetime.datetime.now().isoformat(timespec="seconds"), "library": s["library"],
+                                  "state": state, "pending": pending, "entries": entries})
+            write_json(meta_path, {"v": 1, "items": meta})
+
+        save("listing")
+        log(f"{len(files)} file(s) -> {len(entries)} entr(ies) ({sum(1 for e in entries if e['kind'] == 'film')} films, "
+            f"{sum(1 for e in entries if e['kind'] == 'show')} shows)")
+        key = s["tmdb_key"]
+        if key and s["network"]:
+            t = tmdb or Tmdb(key)
+            n, failed = fill_metadata(entries, meta, dd, t, save, log)
+            log(f"metadata: {n} fetched" + (f", {failed} left for next time" if failed else ""))
+        else:
+            log("no TMDB key (or network off): cards show titles and quality chips only. Set tmdb_key in [shelf] to get posters.")
+        save("done")
+        return 0
+    finally:
+        lock.__exit__()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="catalog builder for mpv-shelf")
+    ap.add_argument("command", nargs="?", default="scan", choices=("scan", "plan", "status"))
+    ap.add_argument("--once", action="store_true", help="same as scan (what the mpv script runs)")
+    ap.add_argument("--config"); ap.add_argument("--library"); ap.add_argument("--data-dir"); ap.add_argument("--tmdb-key")
+    ap.add_argument("--min-size-mb", type=float); ap.add_argument("--no-network", action="store_true")
+    args = ap.parse_args(argv)
+    s = read_settings(args)
+    if args.command != "status" and not s["library"]:
+        print("no library: set library= in ~/.config/seekthumbs/config.ini ([shelf] or [seekthumbs]) or pass --library", file=sys.stderr)
+        return 2
+    if args.command == "plan":
+        return cmd_plan(s)
+    if args.command == "status":
+        return cmd_status(s)
+    return cmd_scan(s)
+
+
+if __name__ == "__main__":
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)      # `| head` ends quietly
+    sys.exit(main())
