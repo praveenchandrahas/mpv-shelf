@@ -274,6 +274,32 @@ class Scan(unittest.TestCase):
         self.assertEqual((s["library"], s["min_size_mb"], s["tmdb_key"]), ("/x", 5.0, "k1"))
 
 
+class Flaky(unittest.TestCase):
+    def test_dropped_handshake_is_retried_then_succeeds(self):
+        calls = []
+        def fake(url, headers=None, timeout=15):
+            calls.append(url)
+            if len(calls) <= 2:
+                raise si.Offline("SSL: UNEXPECTED_EOF_WHILE_READING")
+            return 200, b'{"results": []}', {}
+        real, si.http_get = si.http_get, fake
+        try:
+            self.assertEqual(si.Tmdb("k", sleep=lambda s: None).get_json("/search/movie", query="x"), {"results": []})
+        finally:
+            si.http_get = real
+        self.assertEqual(len(calls), 3)
+
+    def test_a_network_that_never_answers_still_raises_offline(self):
+        def fake(url, headers=None, timeout=15):
+            raise si.Offline("down")
+        real, si.http_get = si.http_get, fake
+        try:
+            with self.assertRaises(si.Offline):
+                si.Tmdb("k", sleep=lambda s: None).get_json("/search/movie", query="x")
+        finally:
+            si.http_get = real
+
+
 class Cli(unittest.TestCase):
     def test_plan_pipe_head_is_quiet(self):
         import subprocess

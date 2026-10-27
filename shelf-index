@@ -276,12 +276,21 @@ class Tmdb:
         else:
             params["api_key"] = self.key
         url = f"{TMDB_API}{path}?{urllib.parse.urlencode(params)}"
-        for attempt in range(4):
+        net_tries = 0
+        for attempt in range(5):
             wait = REQUEST_GAP_S - (time.monotonic() - self.last)
             if wait > 0:
                 self.sleep(wait)
             self.last = time.monotonic()
-            code, body, hdr = http_get(url, headers)
+            try:
+                code, body, hdr = http_get(url, headers)
+            except Offline:
+                # a dropped TLS handshake or a reset is common on some ISPs and usually passes on the next try: wait a little, then ask again
+                net_tries += 1
+                if net_tries > 3:
+                    raise
+                self.sleep(2 * net_tries)
+                continue
             if code == 429:
                 self.sleep(min(30, float(hdr.get("Retry-After", "2") or 2)))
                 continue
@@ -383,17 +392,22 @@ def fill_metadata(entries, meta, data_dir, tmdb, save, say=print, now=time.time)
             todo.append(e)
         elif m and not m.get("miss") and m.get("poster_path") and not m.get("poster") and not os.path.exists(os.path.join(pdir, f"{e['id']}.jpg")):
             todo.append(e)
-    n = 0
+    n = bad_net = 0
     for e in todo:
         k = meta_key(e)
         try:
             found = tmdb.lookup(e)
         except Offline as ex:
+            bad_net += 1
+            if bad_net < 3:
+                say(f"network error on {e['title']} ({ex}); skipping it for now")
+                continue
             say(f"offline ({ex}); artwork will be fetched next time")
             return n, len(todo) - n
         except PermissionError as ex:
             say(str(ex))
             return n, len(todo) - n
+        bad_net = 0                                     # only consecutive network errors mean "offline"
         if not found:
             meta[k] = {"miss": True, "fetched": int(now())}
         else:
