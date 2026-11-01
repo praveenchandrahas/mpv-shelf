@@ -1,0 +1,85 @@
+#!/bin/bash
+# mpv-shelf-setup: puts the packaged mpv-shelf into the mpv folders of ONE user. The package itself never does this.
+#
+#   mpv-shelf-setup [--dry-run] install     copy shelf.lua into ~/.config/mpv/scripts (and ~/.config/mpv-object-audio if it exists),
+#                                           create script-opts/shelf.conf if missing (never overwritten), add the key to input.conf
+#   mpv-shelf-setup [--dry-run] uninstall   take them out again (your catalog and history in ~/.local/share/mpv-shelf are kept)
+#   mpv-shelf-setup check                   report only
+#
+# Environment: SHELF_KEY (default Ctrl+b), XDG_CONFIG_HOME. Same marks in input.conf as install-shelf.sh, so the two can take over from each other.
+set -u
+DRY=0; ACTION=
+for a in "$@"; do
+  case "$a" in
+    --dry-run|-n) DRY=1 ;;
+    install|uninstall|check) ACTION=$a ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $a (try --help)" >&2; exit 2 ;;
+  esac
+done
+[ -n "$ACTION" ] || { echo "usage: mpv-shelf-setup [--dry-run] install|uninstall|check" >&2; exit 2; }
+if [ "$(id -u)" = 0 ] && [ "$DRY" = 0 ] && [ "$ACTION" != check ] && [ -z "${SDHT_ALLOW_ROOT:-}" ]; then echo "Run mpv-shelf-setup as your normal user, not as root." >&2; exit 1; fi
+SHARE=/usr/share/mpv-shelf
+CFG=${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}
+KEY=${SHELF_KEY:-Ctrl+b}
+BINDING="$KEY script-binding shelf/open"
+BEGIN="# >>> mpv-shelf (managed by install-shelf.sh)"
+END="# <<< mpv-shelf"
+DIRS=("$CFG/mpv" "$CFG/mpv-object-audio")
+
+say() { if [ "$DRY" = 1 ]; then echo "would: $*"; else echo "$*"; fi; }
+strip_block() {   # remove our block and any stray bare-number lines from input.conf $1
+  local f=$1 tmp
+  [ -f "$f" ] || return 0
+  tmp=$(mktemp)
+  awk -v b="$BEGIN" -v e="$END" '$0 == b { skip = 1; next } $0 == e { skip = 0; next } skip { next } /^[0-9]+$/ { next } { print }' "$f" > "$tmp"
+  cat "$tmp" > "$f"; rm -f "$tmp"
+}
+BIN=${HOME:-/nonexistent}/.local/bin
+shadowing() {
+  if [ -e "$BIN/shelf-index" ]; then
+    echo "NOTE: $BIN/shelf-index exists: a hand-installed copy; if $BIN is before /usr/bin on PATH it hides the packaged one."
+    echo "      To use the packaged one: remove it (install-shelf.sh remove does that)."
+  else echo "no hand-installed shelf-index in $BIN"; fi
+  return 0
+}
+
+case "$ACTION" in
+  check)
+    shadowing
+    for d in "${DIRS[@]}"; do [ -f "$d/scripts/shelf.lua" ] && echo "installed in $d" || echo "not in $d"; done
+    command -v ffmpeg >/dev/null 2>&1 || echo "ffmpeg not found: posters need it"
+    ;;
+  install)
+    shadowing
+    for f in shelf.lua shelf.conf; do [ -f "$SHARE/$f" ] || { echo "$SHARE/$f is missing (reinstall the mpv-shelf package)" >&2; exit 1; }; done
+    command -v ffmpeg >/dev/null 2>&1 || echo "Note: ffmpeg is not on PATH; posters need it." >&2
+    for d in "${DIRS[@]}"; do
+      if [ "$d" != "$CFG/mpv" ] && [ ! -d "$d" ]; then continue; fi    # ~/.config/mpv always; the Atmos config folder only if it exists already
+      say "install shelf.lua into $d/scripts and the options into $d/script-opts"
+      if [ "$DRY" = 0 ]; then
+        mkdir -p "$d/scripts" "$d/script-opts"
+        install -m 644 "$SHARE/shelf.lua" "$d/scripts/shelf.lua"
+        [ -f "$d/script-opts/shelf.conf" ] || install -m 644 "$SHARE/shelf.conf" "$d/script-opts/shelf.conf"   # yours once it exists: never overwritten
+        install -m 644 "$SHARE/shelf.conf" "$d/script-opts/shelf.conf.default"
+        touch "$d/input.conf"; strip_block "$d/input.conf"
+      fi
+      if [ -f "$d/input.conf" ] && grep -Eq '^[[:space:]]*'"${KEY//+/\\+}"'[[:space:]]' "$d/input.conf"; then
+        echo "Note: $d/input.conf already binds $KEY elsewhere; add this yourself if you want it: $BINDING" >&2
+      else
+        say "add to $d/input.conf: $BINDING (in a marked block)"
+        if [ "$DRY" = 0 ]; then printf '%s\n%s\n%s\n' "$BEGIN" "$BINDING" "$END" >> "$d/input.conf"; fi
+      fi
+    done
+    echo "Next: shelf-index plan, then shelf-index scan (see /usr/share/doc/mpv-shelf/README.md)."
+    if [ "$DRY" = 1 ]; then echo "(dry run: nothing was changed)"; fi
+    ;;
+  uninstall)
+    for d in "${DIRS[@]}"; do
+      say "remove $d/scripts/shelf.lua, $d/script-opts/shelf.conf.default and the marked block in $d/input.conf"
+      if [ "$DRY" = 0 ]; then rm -f "$d/scripts/shelf.lua" "$d/script-opts/shelf.conf.default"; strip_block "$d/input.conf"; fi
+    done
+    echo "Kept: your shelf.conf, and your catalog and watch history in ~/.local/share/mpv-shelf."
+    if [ "$DRY" = 1 ]; then echo "(dry run: nothing was changed)"; fi
+    ;;
+esac

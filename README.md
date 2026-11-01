@@ -1,5 +1,7 @@
 # mpv-shelf
 
+[![CI](https://github.com/praveenchandrahas/mpv-shelf/actions/workflows/ci.yml/badge.svg)](https://github.com/praveenchandrahas/mpv-shelf/actions/workflows/ci.yml) *(CI = unit tests, lint, and a package install/remove test in a clean Ubuntu 24.04 container. A green badge does not show the software works on a real rig.)*
+
 ![mpv-shelf: your film library on your TV. A lean media shelf for mpv](docs/img/banner.png)
 
 *Illustration, not a screenshot. The screen, the sidebar and every poster in it are made up for the picture, and some of what it shows is not in version 1: playlists, themes, a Settings page, the sidebar and the large hero banner do not exist (only an accent colour, the number of columns and a few behaviours are configurable; see "Options"). What works today is described in the text below.*
@@ -12,6 +14,22 @@ A Netflix-style film browser for [mpv](https://mpv.io), over a **local folder** 
 ![Illustration of a title page](docs/img/preview-title.png)
 
 > **These two images are simulations, not screenshots.** They are libass renderings of what `shelf.lua` asks mpv to draw, with placeholder posters (`tools/make_preview.py`). How it really looks and feels in mpv is **not yet verified**.
+
+## Install (pre-release, experimental)
+
+Releases are marked **pre-release** on the [releases page](https://github.com/praveenchandrahas/mpv-shelf/releases). Download the `.deb` and `SHA256SUMS` from one release, check, then install:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+sudo apt install ./mpv-shelf_0.1.0_all.deb
+mpv-shelf-setup --dry-run   # then: mpv-shelf-setup install
+```
+
+Needs mpv with Lua and ffmpeg.
+
+The package puts files under `/usr` only. Its install and remove scripts do not enable or start services, do not write into any home folder, and do not touch CamillaDSP or PipeWire configuration; the setup command above does the per-user part, and `--dry-run` shows what it would do first. Details, the other repositories' packages, and the one-command installer are in the main repository's [packaging notes](https://github.com/praveenchandrahas/Software-Defined-Home-Theatre/blob/main/docs/packaging.md).
+
+What was checked: written with an AI assistant; checked against simulated rooms and REW exports; used and checked by the author in his own room (one room, one author). No external or second-person validation yet. The packages are unsigned. CI installs and removes them in clean Ubuntu 24.04; the packaging itself has not been run on the author's own rig.
 
 ## Status: v1, tested only against a mocked mpv
 
