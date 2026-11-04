@@ -1,5 +1,10 @@
 # Usage
 
+![Illustration of the home screen](img/preview-home.png)
+![Illustration of a title page](img/preview-title.png)
+
+> **These two images are simulations, not screenshots.** They are libass renderings of what `shelf.lua` asks mpv to draw, with placeholder posters (`tools/make_preview.py`). How it really looks and feels in mpv is **not yet verified**.
+
 `Ctrl+b` opens and closes it (the installer adds `Ctrl+b script-binding shelf/open` to `input.conf`, between marked comment lines; if you already use that key it tells you and changes nothing).
 
 | Key | Does |
