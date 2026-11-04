@@ -10,7 +10,7 @@
 
 A Netflix-style film browser for [mpv](https://mpv.io), over a **local folder** such as a debrid/WebDAV mount. Posters, ratings and quality chips, a Continue Watching row, search, TV seasons, and it remembers where you stopped.
 
-Full docs: https://praveenchandrahas.github.io/mpv-shelf/
+**Full docs:** https://praveenchandrahas.github.io/mpv-shelf/ — install and usage.
 
 ![Illustration of the home screen](docs/img/preview-home.png)
 ![Illustration of a title page](docs/img/preview-title.png)
